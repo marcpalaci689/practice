@@ -13,7 +13,10 @@ Functional requirements
 - A well-formed but unseen short URL raises UnknownCodeError.
 - A malformed short URL (wrong prefix, wrong length, non-base62 suffix, or a
   bare code) raises InvalidUrlError.
-- Single-process, in-memory only. No persistence or distributed concurrency.
+- Persistence is abstracted behind UrlStore (load/save of the url -> code dict).
+  JsonFileStore writes {repo_root}/short_urls.json by default. URLShortener
+  pre-warms its maps from store.load() on init and store.save()s after each
+  newly generated code. Single-process only; no distributed concurrency.
 
 API
 - LongUrl(url): frozen validated value object. Identity is the URL string only.
@@ -32,8 +35,10 @@ Encoding
 
 Storage
 - Bidirectional in-memory maps: LongUrl -> code and code -> LongUrl.
+- Maps are pre-warmed from UrlStore.load() at startup.
 - Always store the original LongUrl the caller passed in. Perturbation is only
   an encode() argument and is never written into the maps.
+- After allocating a new code, persist the full url -> code dict via store.save().
 
 Collision handling
 - If the long URL is already stored, return the existing short URL.
@@ -42,9 +47,11 @@ Collision handling
 '''
 
 import hashlib
+import json
 import random
 import string
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Protocol
 
 BASE62_ALPHABET = string.ascii_letters + string.digits
@@ -84,6 +91,35 @@ class ShorteningEncoder(Protocol):
         '''
         ...
 
+class UrlStore(Protocol):
+    def load(self) -> dict[str, str]:
+        '''Return url -> code. Missing / empty store returns {}.'''
+        ...
+
+    def save(self, data: dict[str, str]) -> None:
+        '''Persist the full url -> code dictionary.'''
+        ...
+
+
+class JsonFileStore:
+    def __init__(self, path: str | Path | None = None) -> None:
+        self.path = Path(path) if path is not None else Path(__file__).resolve().parents[1] / "short_urls.json"
+
+    def load(self) -> dict[str, str]:
+        if not self.path.exists():
+            return {}
+        with self.path.open() as handle:
+            data = json.load(handle)
+        if not isinstance(data, dict):
+            return {}
+        return {str(url): str(code) for url, code in data.items()}
+
+    def save(self, data: dict[str, str]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("w") as handle:
+            json.dump(data, handle, indent=2)
+
+
 class B62Encoder(ShorteningEncoder):
     def encode(self, long_url: LongUrl, perturbation: int | None = None) -> str:
         '''
@@ -104,13 +140,21 @@ class B62Encoder(ShorteningEncoder):
         random.Random(perturbation).shuffle(chars)
         return "".join(chars)
 
+
 @dataclass
 class URLShortener:
     base_url: str = field(default="https://sho.rt/")
     encoder: ShorteningEncoder = field(default_factory=B62Encoder)
+    store: UrlStore = field(default_factory=JsonFileStore)
 
     _long_url_to_code: dict[LongUrl, str] = field(default_factory=dict, init=False)
     _code_to_long_url: dict[str, LongUrl] = field(default_factory=dict, init=False)
+
+    def __post_init__(self) -> None:
+        for url, code in self.store.load().items():
+            long_url = LongUrl(url)
+            self._long_url_to_code[long_url] = code
+            self._code_to_long_url[code] = long_url
     
     def shorten(self, long_url: LongUrl) -> str:
         '''
@@ -129,6 +173,7 @@ class URLShortener:
             if owner is None:
                 self._long_url_to_code[long_url] = code
                 self._code_to_long_url[code] = long_url
+                self.store.save({item.url: item_code for item, item_code in self._long_url_to_code.items()})
                 return self.base_url + code
             perturbation = 0 if perturbation is None else perturbation + 1
         raise RuntimeError("could not allocate a unique short code")

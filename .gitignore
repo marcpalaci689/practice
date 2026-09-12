@@ -37,3 +37,6 @@ htmlcov/
 .vscode/
 *.swp
 .DS_Store
+
+# Local URL shortener store
+short_urls.json
