@@ -15,13 +15,17 @@ DEFAULT_BASE = "https://sho.rt/"
 
 
 class CollisionEncoder:
-    """Forces a collision at perturbation 0 so shorten must retry."""
+    """Forces a collision when perturbation is None so shorten must retry."""
 
     COLLISION_CODE = "aaaaaaaa"
     RESOLVED_CODE = "bbbbbbbb"
 
-    def encode(self, long_url: LongUrl) -> str:
-        if long_url._perturbation_count == 0:
+    def __init__(self) -> None:
+        self.perturbations: list[int | None] = []
+
+    def encode(self, long_url: LongUrl, perturbation: int | None = None) -> str:
+        self.perturbations.append(perturbation)
+        if perturbation is None:
             return self.COLLISION_CODE
         return self.RESOLVED_CODE
 
@@ -47,20 +51,6 @@ class TestLongUrl:
         with pytest.raises(InvalidUrlError):
             LongUrl(url)
 
-    def test_perturb_returns_new_instance_with_incremented_count(self):
-        original = LongUrl("https://example.com")
-        perturbed = original.perturb()
-
-        assert perturbed is not original
-        assert perturbed.url == original.url
-        assert original._perturbation_count == 0
-        assert perturbed._perturbation_count == 1
-
-    def test_repeated_perturb_increments_further(self):
-        url = LongUrl("https://example.com")
-        twice = url.perturb().perturb()
-        assert twice._perturbation_count == 2
-
 
 class TestB62Encoder:
     def setup_method(self):
@@ -69,16 +59,19 @@ class TestB62Encoder:
     def test_encode_is_deterministic(self):
         url = LongUrl("https://example.com/path")
         assert self.encoder.encode(url) == self.encoder.encode(url)
+        assert self.encoder.encode(url, None) == self.encoder.encode(url, None)
 
     def test_encode_same_url_same_perturbation_is_stable(self):
-        a = LongUrl("https://example.com", _perturbation_count=3)
-        b = LongUrl("https://example.com", _perturbation_count=3)
-        assert self.encoder.encode(a) == self.encoder.encode(b)
+        url = LongUrl("https://example.com")
+        assert self.encoder.encode(url, 3) == self.encoder.encode(url, 3)
 
-    def test_encode_includes_perturbation_count(self):
-        base = LongUrl("https://example.com")
-        perturbed = LongUrl("https://example.com", _perturbation_count=1)
-        assert self.encoder.encode(base) != self.encoder.encode(perturbed)
+    def test_none_differs_from_integer_perturbation(self):
+        url = LongUrl("https://example.com")
+        assert self.encoder.encode(url, None) != self.encoder.encode(url, 0)
+
+    def test_different_perturbation_seeds_produce_different_codes(self):
+        url = LongUrl("https://example.com")
+        assert self.encoder.encode(url, 0) != self.encoder.encode(url, 1)
 
     def test_different_urls_produce_different_codes(self):
         a = LongUrl("https://example.com/a")
@@ -89,6 +82,14 @@ class TestB62Encoder:
         code = self.encoder.encode(LongUrl("https://example.com"))
         assert len(code) == 8
         assert all(ch in BASE62 for ch in code)
+
+    def test_perturbed_url_is_deterministic_shuffle_of_original(self):
+        url = "https://example.com"
+        first = self.encoder._perturbed_url(url, 7)
+        second = self.encoder._perturbed_url(url, 7)
+        assert first == second
+        assert first != url
+        assert sorted(first) == sorted(url)
 
 
 class TestURLShortener:
@@ -153,22 +154,21 @@ class TestCollisions:
         self.url_a = LongUrl("https://example.com/a")
         self.url_b = LongUrl("https://example.com/b")
 
-    def test_second_url_is_perturbed_off_the_colliding_code(self):
+    def test_second_url_is_retried_with_integer_perturbation(self):
         short_a = self.shortener.shorten(self.url_a)
         short_b = self.shortener.shorten(self.url_b)
 
         assert short_a == f"{DEFAULT_BASE}{CollisionEncoder.COLLISION_CODE}"
         assert short_b == f"{DEFAULT_BASE}{CollisionEncoder.RESOLVED_CODE}"
         assert short_a != short_b
+        assert self.encoder.perturbations == [None, None, 0]
 
-    def test_resolve_returns_original_unperturbed_urls_after_collision(self):
+    def test_resolve_returns_original_urls_after_collision(self):
         short_a = self.shortener.shorten(self.url_a)
         short_b = self.shortener.shorten(self.url_b)
 
         assert self.shortener.resolve(short_a) == self.url_a
         assert self.shortener.resolve(short_b) == self.url_b
-        assert self.shortener.resolve(short_a)._perturbation_count == 0
-        assert self.shortener.resolve(short_b)._perturbation_count == 0
 
     def test_first_url_stays_idempotent_after_later_collision(self):
         short_a = self.shortener.shorten(self.url_a)

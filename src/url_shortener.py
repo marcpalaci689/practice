@@ -1,23 +1,50 @@
 '''
-Build a URL shotener.
+URL shortener.
 
-For this exercise, assume that:
+Functional requirements
+- Valid long URLs start with http:// or https://. Anything else raises InvalidUrlError.
+- shorten(long_url) returns a full short URL: {base_url}{code}.
+  Default base_url is https://sho.rt/. Code is exactly 8 base62 characters [A-Za-z0-9].
+- Shortening the same long URL repeatedly returns the same short URL.
+- Two different long URLs never share a short code.
+- resolve(shorten(url)) returns the original LongUrl exactly.
+- resolve takes the full short URL (not a bare code) and parses the code by
+  stripping self.base_url. A custom base_url must work; do not hardcode the host.
+- A well-formed but unseen short URL raises UnknownCodeError.
+- A malformed short URL (wrong prefix, wrong length, non-base62 suffix, or a
+  bare code) raises InvalidUrlError.
+- Single-process, in-memory only. No persistence or distributed concurrency.
 
-Valid long URLs start with http:// or https://
-The short URL format is:
-https://sho.rt/<code>
-<code> is exactly 8 characters
-Shortening the same long URL repeatedly must return the same short URL
-Two different long URLs must never resolve to the same short code
-resolve(shorten(url)) must return the original URL exactly
-Resolving an unknown code should fail cleanly
-You can assume a single-process, local application for now
-You do not need to solve distributed concurrency yet
+API
+- LongUrl(url): frozen validated value object. Identity is the URL string only.
+  Perturbation is not stored on LongUrl.
+- URLShortener.shorten(long_url: LongUrl) -> str
+- URLShortener.resolve(short_url: str) -> LongUrl
+- ShorteningEncoder.encode(long_url, perturbation: int | None = None) -> str
+
+Encoding
+- B62Encoder hashes the (possibly perturbed) URL with SHA-256, then base62-encodes
+  to exactly 8 characters.
+- First encode attempt uses perturbation=None and hashes the URL as-is.
+- On collision, shorten retries with perturbation 0, 1, 2, ... as a random seed.
+  The seed deterministically shuffles the URL characters before hashing.
+- Same (url, perturbation) pair always produces the same code.
+
+Storage
+- Bidirectional in-memory maps: LongUrl -> code and code -> LongUrl.
+- Always store the original LongUrl the caller passed in. Perturbation is only
+  an encode() argument and is never written into the maps.
+
+Collision handling
+- If the long URL is already stored, return the existing short URL.
+- If a newly generated code is already bound to a different URL, increment
+  the perturbation seed and re-encode. Cap retries to avoid an infinite loop.
 '''
 
 import hashlib
+import random
 import string
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Protocol
 
 BASE62_ALPHABET = string.ascii_letters + string.digits
@@ -39,15 +66,6 @@ class UnknownCodeError(Exception):
 @dataclass(frozen=True)
 class LongUrl:
     url: str
-    _perturbation_count: int = 0
-    
-    def perturb(self) -> "LongUrl":
-        '''
-        Return a new LongUrl with an incremented perturbation count.
-        Used only as a temporary encode() input; never store the result
-        as a map key.
-        '''
-        return replace(self, _perturbation_count=self._perturbation_count + 1)
     
     def __post_init__(self):
         '''
@@ -58,25 +76,32 @@ class LongUrl:
 
 
 class ShorteningEncoder(Protocol):
-    def encode(self, long_url: LongUrl) -> str:
+    def encode(self, long_url: LongUrl, perturbation: int | None = None) -> str:
         '''
-        encode the long url to get a code
+        encode the long url to get a code. perturbation is None on the first
+        attempt; after a collision it is a monotonically increasing integer
+        used as a deterministic random seed.
         '''
         ...
 
 class B62Encoder(ShorteningEncoder):
-    def encode(self, long_url: LongUrl) -> str:
+    def encode(self, long_url: LongUrl, perturbation: int | None = None) -> str:
         '''
-        encode the long url to get a code. This encoding should use a hashing function followed
-        by a base62 encoding. The hashing should take into account both the url and the 
-        perturbation count.
+        Hash a (possibly seeded-perturbed) URL, then base62-encode to 8 chars.
         '''
-        payload = f"{long_url.url}\0{long_url._perturbation_count}".encode()
+        payload = self._perturbed_url(long_url.url, perturbation).encode()
         value = int.from_bytes(hashlib.sha256(payload).digest(), "big")
         chars: list[str] = []
         for _ in range(8):
             value, remainder = divmod(value, 62)
             chars.append(BASE62_ALPHABET[remainder])
+        return "".join(chars)
+
+    def _perturbed_url(self, url: str, perturbation: int | None) -> str:
+        if perturbation is None:
+            return url
+        chars = list(url)
+        random.Random(perturbation).shuffle(chars)
         return "".join(chars)
 
 @dataclass
@@ -91,22 +116,21 @@ class URLShortener:
         '''
         Return https://sho.rt/<code> (self.base_url + code).
         If this long url was already shortened, return the existing short URL.
-        On code collision with a different long url, perturb a copy and
-        re-encode until no collision is found. Always store the original
-        (unperturbed) LongUrl in the maps.
+        On code collision, re-encode with perturbation None, then 0, 1, 2, ...
+        Always store the original LongUrl in the maps.
         '''
         if long_url in self._long_url_to_code:
             return self.base_url + self._long_url_to_code[long_url]
 
-        candidate = long_url
+        perturbation: int | None = None
         for _ in range(64):
-            code = self.encoder.encode(candidate)
+            code = self.encoder.encode(long_url, perturbation)
             owner = self._code_to_long_url.get(code)
             if owner is None:
                 self._long_url_to_code[long_url] = code
                 self._code_to_long_url[code] = long_url
                 return self.base_url + code
-            candidate = candidate.perturb()
+            perturbation = 0 if perturbation is None else perturbation + 1
         raise RuntimeError("could not allocate a unique short code")
 
     def resolve(self, short_url: str) -> LongUrl:
